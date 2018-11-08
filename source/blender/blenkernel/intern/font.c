@@ -636,6 +636,27 @@ struct TempLineInfo {
 	int   wspace_nr;  /* number of whitespaces of line */
 };
 
+typedef struct VFontToCurveIter {
+	int iteraction;
+	float scale_to_fit;
+	struct {
+		float min;
+		float max;
+	} bisect;
+	bool ok;
+	int status;
+} VFontToCurveIter;
+
+enum {
+	VFONT_TO_CURVE_INIT = 0,
+	VFONT_TO_CURVE_BISECT,
+	VFONT_TO_CURVE_SCALE_ONCE,
+	VFONT_TO_CURVE_DONE,
+};
+
+#define FONT_TO_CURVE_SCALE_ITERATIONS 20
+#define FONT_TO_CURVE_SCALE_THRESHOLD 0.0001f
+
 /**
  * Font metric values explained:
  *
@@ -652,10 +673,11 @@ struct TempLineInfo {
 #define ASCENT(vfd) ((vfd)->ascender * (vfd)->em_height)
 #define DESCENT(vfd) ((vfd)->em_height - ASCENT(vfd))
 
-static bool vfont_to_curve(Object *ob, Curve *cu, int mode, ListBase *r_nubase,
+static bool vfont_to_curve(Object *ob, Curve *cu, int mode,
+                           VFontToCurveIter *iter_data,
+                           ListBase *r_nubase,
                            const wchar_t **r_text, int *r_text_len, bool *r_text_free,
-                           struct CharTrans **r_chartransdata,
-                           const float scale)
+                           struct CharTrans **r_chartransdata)
 {
 	EditFont *ef = cu->editfont;
 	EditFontSelBox *selboxes = NULL;
@@ -676,7 +698,7 @@ static bool vfont_to_curve(Object *ob, Curve *cu, int mode, ListBase *r_nubase,
 	const wchar_t *mem = NULL;
 	wchar_t ascii;
 	bool ok = false;
-	const float font_size = cu->fsize * scale;
+	const float font_size = cu->fsize * iter_data->scale_to_fit;
 	const float xof_scale = cu->xof / font_size;
 	const float yof_scale = cu->yof / font_size;
 	int last_line = -1;
@@ -1263,7 +1285,9 @@ makebreak:
 		}
 	}
 
-	if (ELEM(mode, FO_CURSUP, FO_CURSDOWN, FO_PAGEUP, FO_PAGEDOWN) && (scale == 1.0f)) {
+	if (ELEM(mode, FO_CURSUP, FO_CURSDOWN, FO_PAGEUP, FO_PAGEDOWN) && 
+	    iter_data->status == VFONT_TO_CURVE_INIT)
+	{
 		ct = &chartransdata[ef->pos];
 
 		if (ELEM(mode, FO_CURSUP, FO_PAGEUP) && ct->linenr == 0) {
@@ -1386,10 +1410,10 @@ makebreak:
 		}
 	}
 
-	float scale_to_fit = 1.0f;
-	if (scale != 1.0f) {
-		/* That means we are in the second run, in this case, just exit. */
+	if (iter_data->status == VFONT_TO_CURVE_SCALE_ONCE) {
+		/* That means we were in a final run, just exit. */
 		BLI_assert(cu->overflow == CU_OVERFLOW_SCALE);
+		iter_data->status = VFONT_TO_CURVE_DONE;
 	}
 	else if (cu->overflow == CU_OVERFLOW_NONE) {
 		/* Do nothing. */
@@ -1398,7 +1422,11 @@ makebreak:
 		/* Do nothing. */
 	}
 	else if (cu->totbox > 1) {
-		/* Do nothing. This is too complex to tackle. */
+		/* Do nothing. This is too complex to tackle.
+		 * Consider that user may mix textbox with and withough both width and height
+		 * constraints. I would discorage users to expect scale to fit and multiple
+		 * text boxes. We can still tackle this in the future though.
+		 * */
 	}
 	else if (cu->overflow == CU_OVERFLOW_SCALE) {
 		if (tb_scale.w == 0.0) {
@@ -1406,31 +1434,79 @@ makebreak:
 			 * Since there is no width limit, all the new lines are from line breaks. */
 			if ((last_line != -1) && (lnr > last_line)) {
 				const float total_text_height = lnr * linedist;
-				scale_to_fit = tb_scale.h / total_text_height;
+				iter_data->scale_to_fit = tb_scale.h / total_text_height;
+				iter_data->status = VFONT_TO_CURVE_SCALE_ONCE;
 			}
 		}
 		else if (tb_scale.h == 0.0f) {
 			/* This is a horizontal overflow. */
 			if (lnr > 1) {
 				/* We make sure longest line before it broke can fit here. */
-				scale_to_fit = tb_scale.w / (longest_line_length);
+				float scale_to_fit = tb_scale.w / (longest_line_length);
 				scale_to_fit -= FLT_EPSILON;
+
+				iter_data->scale_to_fit = scale_to_fit;
+				iter_data->status = VFONT_TO_CURVE_SCALE_ONCE;
 			}
 		}
 		else {
-			/* This is the really complicated case, as we would need to iterate over this function
-			 * a few times until we get a working result.
+			/* This is the really complicated case, the best we can do is to iterate over
+			 * this function a few times until we get an acceptable result.
+			 *
 			 * Keep in mind that there is no single number that will make all fit to the end.
-			 * In a way, our ultimate goal is to get the number of extra lines to zero.
-			 * For now we simply don't support it. If we tackle this we can apply the same approach
-			 * for when there are more than one text box.
+			 * In a way, our ultimate goal is to get the highest scale that still leads to the
+			 * number of extra lines to zero.
 			 */
+			if (iter_data->status == VFONT_TO_CURVE_INIT) {
+				if ((last_line != -1) && (lnr > last_line)) {
+					const float total_text_height = lnr * linedist;
+					float scale_to_fit = tb_scale.h / total_text_height;
+
+					iter_data->bisect.max = 1.0f;
+					iter_data->bisect.min = scale_to_fit;
+
+					iter_data->status = VFONT_TO_CURVE_BISECT;
+				}
+			}
+			else {
+				BLI_assert(iter_data->status == VFONT_TO_CURVE_BISECT);
+				/* Try to get the highest scale that gives us the exactly
+				 * number of lines we need. */
+				bool valid = false;
+
+				if ((last_line != -1) && (lnr > last_line)) {
+					/* It is overflowing, scale it down. */
+					iter_data->bisect.max = iter_data->scale_to_fit;
+				}
+				else {
+					/* It fits inside the textbox, scale it up. */
+					iter_data->bisect.min = iter_data->scale_to_fit;
+					valid = true;
+				}
+
+				/* Bisecting to try to find the best fit. */
+				iter_data->scale_to_fit = (iter_data->bisect.max + iter_data->bisect.min) * 0.5f;
+
+				/* We iterated enough or got a good enough result. */
+				if ((!iter_data->iteraction--) ||
+				    ((iter_data->bisect.max - iter_data->bisect.min) < (cu->fsize * FONT_TO_CURVE_SCALE_THRESHOLD)))
+				{
+					if (valid) {
+						iter_data->status = VFONT_TO_CURVE_DONE;
+					}
+					else {
+						iter_data->scale_to_fit = iter_data->bisect.min;
+						iter_data->status = VFONT_TO_CURVE_SCALE_ONCE;
+					}
+				}
+			}
 		}
 	}
 
 	/* Scale to fit only works for single text box layouts. */
-	if ((scale_to_fit < 1.0f) &&
-	    (cu->totbox == 1))
+	if (ELEM(iter_data->status,
+	         VFONT_TO_CURVE_SCALE_ONCE,
+	         VFONT_TO_CURVE_BISECT))
 	{
 		/* Always cleanup before going to the scale-to-fit repetition. */
 		if (r_nubase != NULL) {
@@ -1444,17 +1520,7 @@ makebreak:
 		if (ef == NULL) {
 			MEM_freeN((void *)mem);
 		}
-
-		ok = vfont_to_curve(ob,
-		               cu,
-		               mode,
-		               r_nubase,
-		               r_text,
-		               r_text_len,
-		               r_text_free,
-		               r_chartransdata,
-		               scale_to_fit);
-		return ok;
+		return true;
 	}
 	else {
 		ok = true;
@@ -1495,16 +1561,32 @@ bool BKE_vfont_to_curve_ex(Object *ob, Curve *cu, int mode, ListBase *r_nubase,
                            const wchar_t **r_text, int *r_text_len, bool *r_text_free,
                            struct CharTrans **r_chartransdata)
 {
-	return vfont_to_curve(ob,
-	                      cu,
-	                      mode,
-	                      r_nubase,
-	                      r_text,
-	                      r_text_len,
-	                      r_text_free,
-	                      r_chartransdata,
-	                      1.0f);
+	VFontToCurveIter data = {
+		.iteraction = cu->totbox * FONT_TO_CURVE_SCALE_ITERATIONS,
+		.scale_to_fit = 1.0f,
+		.ok = true,
+		.status = VFONT_TO_CURVE_INIT,
+	};
+
+	do {
+		data.ok &= vfont_to_curve(ob,
+		                          cu,
+		                          mode,
+		                          &data,
+		                          r_nubase,
+		                          r_text,
+		                          r_text_len,
+		                          r_text_free,
+		                          r_chartransdata);
+	} while (data.ok && ELEM(data.status,
+	                         VFONT_TO_CURVE_SCALE_ONCE,
+	                         VFONT_TO_CURVE_BISECT));
+
+	return data.ok;
 }
+
+#undef FONT_TO_CURVE_SCALE_ITERATIONS
+#undef FONT_TO_CURVE_SCALE_THRESHOLD
 
 bool BKE_vfont_to_curve_nubase(Object *ob, int mode, ListBase *r_nubase)
 {
