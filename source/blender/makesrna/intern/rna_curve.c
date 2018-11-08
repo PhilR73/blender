@@ -976,7 +976,7 @@ static void rna_def_font(BlenderRNA *UNUSED(brna), StructRNA *srna)
 
 	static const EnumPropertyItem prop_overflow_items[] = {
 		{CU_OVERFLOW_NONE, "NONE", 0, "Overflow", "Let the text overflow outside the text boxes"},
-		{CU_OVERFLOW_SCALE, "SCALE", 0, "Scale to Fit", "Scale down the text to fit inside the text boxes (it only works for single-text boxes)"},
+		{CU_OVERFLOW_SCALE, "SCALE", 0, "Scale to Fit", "Scale down the text to fit inside the text boxes"},
 		{CU_OVERFLOW_TRUNCATE, "TRUNCATE", 0, "Truncate", "Truncate the text that would go outside the text boxes"},
 		{0, NULL, 0, NULL, NULL}
 	};

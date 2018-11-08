@@ -1421,32 +1421,29 @@ makebreak:
 	else if ((tb_scale.h == 0.0f) && (tb_scale.w == 0.0f)) {
 		/* Do nothing. */
 	}
-	else if (cu->totbox > 1) {
-		/* Do nothing. This is too complex to tackle.
-		 * Consider that user may mix textbox with and withough both width and height
-		 * constraints. I would discorage users to expect scale to fit and multiple
-		 * text boxes. We can still tackle this in the future though.
-		 * */
-	}
 	else if (cu->overflow == CU_OVERFLOW_SCALE) {
-		if (tb_scale.w == 0.0) {
-			/* This is a potential vertical overflow.
-			 * Since there is no width limit, all the new lines are from line breaks. */
-			if ((last_line != -1) && (lnr > last_line)) {
-				const float total_text_height = lnr * linedist;
-				iter_data->scale_to_fit = tb_scale.h / total_text_height;
-				iter_data->status = VFONT_TO_CURVE_SCALE_ONCE;
+		if (cu->totbox == 1) {
+			/* This is a special case, simpler to deal with. */
+			if (tb_scale.w == 0.0) {
+				/* This is a potential vertical overflow.
+				 * Since there is no width limit, all the new lines are from line breaks. */
+				if ((last_line != -1) && (lnr > last_line)) {
+					const float total_text_height = lnr * linedist;
+					iter_data->scale_to_fit = tb_scale.h / total_text_height;
+					iter_data->status = VFONT_TO_CURVE_SCALE_ONCE;
+				}
 			}
-		}
-		else if (tb_scale.h == 0.0f) {
-			/* This is a horizontal overflow. */
-			if (lnr > 1) {
-				/* We make sure longest line before it broke can fit here. */
-				float scale_to_fit = tb_scale.w / (longest_line_length);
-				scale_to_fit -= FLT_EPSILON;
+			else if (tb_scale.h == 0.0f) {
+				/* TODO handle multiple text. */
+				/* This is a horizontal overflow. */
+				if (lnr > 1) {
+					/* We make sure longest line before it broke can fit here. */
+					float scale_to_fit = tb_scale.w / (longest_line_length);
+					scale_to_fit -= FLT_EPSILON;
 
-				iter_data->scale_to_fit = scale_to_fit;
-				iter_data->status = VFONT_TO_CURVE_SCALE_ONCE;
+					iter_data->scale_to_fit = scale_to_fit;
+					iter_data->status = VFONT_TO_CURVE_SCALE_ONCE;
+				}
 			}
 		}
 		else {
@@ -1458,7 +1455,17 @@ makebreak:
 			 * number of extra lines to zero.
 			 */
 			if (iter_data->status == VFONT_TO_CURVE_INIT) {
-				if ((last_line != -1) && (lnr > last_line)) {
+				bool valid = true;
+
+				for (int tb_index = 0; tb_index <= curbox; tb_index++) {
+					TextBox *tb = &cu->tb[tb_index];
+					if ((tb->w == 0.0f) || (tb->h == 0.0f)) {
+						valid = false;
+						break;
+					}
+				}
+
+				if (valid && (last_line != -1) && (lnr > last_line)) {
 					const float total_text_height = lnr * linedist;
 					float scale_to_fit = tb_scale.h / total_text_height;
 
